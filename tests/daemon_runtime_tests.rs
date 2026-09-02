@@ -1678,6 +1678,58 @@ fn env_clone_preserves_unrelated_supervisor_child_specs() {
 }
 
 #[test]
+fn env_clone_refuses_to_drop_a_running_sibling_missing_from_persisted_state() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("env-clone-refuses-missing-running-sibling");
+    let (cwd, env, _, _) = setup_daemon_run_fixture_with_child_sleep(&root, 3600);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+
+    service.sync().unwrap();
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
+        .expect("daemon runtime state did not report both children");
+    let demo_pid = runtime_child_pid(&initial_runtime, "demo").unwrap();
+    let prod_pid = runtime_child_pid(&initial_runtime, "prod").unwrap();
+
+    let original_persisted = read_persisted_service_state(&state_path);
+    let daemon_stopped = Command::new("kill")
+        .args(["-STOP", &daemon.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(daemon_stopped.success());
+
+    let mut persisted = original_persisted.clone();
+    persisted["children"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|child| child["envName"] != "prod");
+    write_persisted_service_state(&state_path, &persisted);
+
+    let cloned = run_ocm(&cwd, &env, &["env", "clone", "demo", "demo-clone"]);
+    write_persisted_service_state(&state_path, &original_persisted);
+    let daemon_continued = Command::new("kill")
+        .args(["-CONT", &daemon.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(daemon_continued.success());
+    sleep(Duration::from_millis(800));
+    let final_runtime = read_persisted_service_state(&runtime_path);
+    stop_process(&mut daemon);
+
+    assert!(!cloned.status.success(), "{}", stdout(&cloned));
+    assert!(
+        stderr(&cloned)
+            .contains("running sibling \"prod\" is absent from persisted supervisor state"),
+        "{}",
+        stderr(&cloned)
+    );
+    assert_eq!(runtime_child_pid(&final_runtime, "demo"), Some(demo_pid));
+    assert_eq!(runtime_child_pid(&final_runtime, "prod"), Some(prod_pid));
+}
+
+#[test]
 fn env_import_preserves_unrelated_supervisor_child_specs() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("env-import-preserves-supervisor-siblings");

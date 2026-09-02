@@ -351,10 +351,29 @@ impl<'a> SupervisorService<'a> {
         let state_path = supervisor_state_path(self.env, self.cwd)?;
         let _lock = lock_supervisor_state(&state_path)?;
         let mut state = self.build_state()?;
-        let persisted_state = read_json::<SupervisorState>(&state_path).ok();
+        let persisted_state = if state_path.exists() {
+            Some(read_json::<SupervisorState>(&state_path).map_err(|error| {
+                format!("failed to read persisted supervisor state before targeted sync: {error}")
+            })?)
+        } else {
+            None
+        };
+        let refreshed_envs = select_envs(&state, persisted_state.as_ref());
+        let runtime_state = self.read_runtime_state()?;
+        let missing_running_sibling = persisted_state.as_ref().and_then(|persisted| {
+            runtime_state.as_ref()?.children.iter().find(|child| {
+                !refreshed_envs.contains(&child.env_name)
+                    && active_child_spec(persisted, &child.env_name).is_none()
+            })
+        });
+        if let Some(child) = missing_running_sibling {
+            return Err(format!(
+                "refusing targeted supervisor sync because running sibling \"{}\" is absent from persisted supervisor state",
+                child.env_name
+            ));
+        }
 
         if let Some(persisted_state) = persisted_state {
-            let refreshed_envs = select_envs(&state, Some(&persisted_state));
             if refreshed_envs.is_empty() {
                 return Ok(view_from_state(&state_path, true, persisted_state));
             }
